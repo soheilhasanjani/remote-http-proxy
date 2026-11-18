@@ -2,7 +2,7 @@
 set -e
 
 # ========================================================
-#       VPS HTTP Proxy Uninstaller
+#       VPS Proxy Uninstaller (Gost & Tinyproxy)
 # ========================================================
 
 if [ "$EUID" -ne 0 ]; then
@@ -11,7 +11,7 @@ if [ "$EUID" -ne 0 ]; then
 fi
 
 echo "=========================================================="
-echo "          VPS HTTP Proxy Uninstallation                   "
+echo "          VPS Proxy Uninstallation                        "
 echo "=========================================================="
 read -p "Are you sure you want to completely remove the proxy? (y/N): " CONFIRM
 CONFIRM=${CONFIRM:-N}
@@ -21,27 +21,29 @@ if [[ ! "$CONFIRM" =~ ^[Yy]$ ]]; then
     exit 0
 fi
 
-echo "[1/3] Stopping and disabling Tinyproxy service..."
+echo "[1/3] Stopping and disabling services..."
+systemctl stop gost 2>/dev/null || true
+systemctl disable gost 2>/dev/null || true
 systemctl stop tinyproxy 2>/dev/null || true
 systemctl disable tinyproxy 2>/dev/null || true
 
-# Close firewall port if stored
-if [ -f /etc/tinyproxy/.proxy_port ]; then
-    SAVED_PORT=$(cat /etc/tinyproxy/.proxy_port)
-    if command -v ufw &> /dev/null && ufw status | grep -q "Status: active"; then
-        echo "Removing UFW rule for port ${SAVED_PORT}..."
-        ufw delete allow ${SAVED_PORT}/tcp 2>/dev/null || true
-    fi
+rm -f /etc/systemd/system/gost.service
+systemctl daemon-reload
+
+echo "[2/3] Removing binary, configs and certificates..."
+rm -f /usr/local/bin/gost
+rm -rf /etc/gost /etc/tinyproxy /var/log/tinyproxy
+
+if command -v ufw &> /dev/null && ufw status | grep -q "Status: active"; then
+    ufw delete allow 18080/tcp 2>/dev/null || true
+    ufw delete allow 18443/tcp 2>/dev/null || true
 fi
 
-echo "[2/3] Purging Tinyproxy and configuration files..."
-apt-get purge -y tinyproxy
-rm -rf /etc/tinyproxy /var/log/tinyproxy
-
-echo "[3/3] Cleaning up unused packages..."
+echo "[3/3] Purging leftover packages..."
+apt-get purge -y tinyproxy 2>/dev/null || true
 apt-get autoremove -y
 
 echo ""
 echo "=========================================================="
-echo " Tinyproxy has been completely removed from this server."
+echo " Proxy has been completely removed from this server."
 echo "=========================================================="

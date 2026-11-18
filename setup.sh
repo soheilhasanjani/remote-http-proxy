@@ -1,112 +1,131 @@
 #!/usr/bin/env bash
 set -e
 
-# ========================================================
-#       VPS HTTP Proxy Setup (Tinyproxy for US Egress)
-# ========================================================
+# ==============================================================================
+#   Dual-Mode Proxy Setup: Plain HTTP (for IDEs) + Encrypted HTTPS (for Browser)
+# ==============================================================================
 
-# Check root privilege
 if [ "$EUID" -ne 0 ]; then
     echo "Error: Please run as root (use: sudo ./setup.sh)"
     exit 1
 fi
 
-DEFAULT_PORT="18080"
-DEFAULT_USER="devproxy"
+HTTP_PORT="18080"
+HTTPS_PORT="18443"
+DEFAULT_USER="soheilhm"
 
 echo "=========================================================="
-echo "    Automated HTTP Proxy Setup (Antigravity & VS Code)    "
+echo "    VPS Dual Proxy Setup (Antigravity/IDEs + Browser)     "
 echo "=========================================================="
 
-# 1. Prompt for port
-read -p "Enter proxy port [Default: ${DEFAULT_PORT}]: " PROXY_PORT
-PROXY_PORT=${PROXY_PORT:-$DEFAULT_PORT}
-
-# 2. Prompt for username
+# 1. Credentials
 read -p "Enter username [Default: ${DEFAULT_USER}]: " PROXY_USER
 PROXY_USER=${PROXY_USER:-$DEFAULT_USER}
 
-# 3. Prompt for password (or auto-generate)
-AUTO_PASS=$(head -c 12 /dev/urandom | base64 | tr -dc 'a-zA-Z0-9' | head -c 12)
-read -p "Enter password [Press Enter to auto-generate: ${AUTO_PASS}]: " PROXY_PASS
+AUTO_PASS=$(head -c 16 /dev/urandom | base64 | tr -dc 'a-zA-Z0-9' | head -c 14)
+read -p "Enter password (alphanumeric only) [Default: ${AUTO_PASS}]: " PROXY_PASS
 PROXY_PASS=${PROXY_PASS:-$AUTO_PASS}
+PROXY_PASS=$(echo "$PROXY_PASS" | tr -dc 'a-zA-Z0-9')
+
+# 2. Get Public IP
+PUBLIC_IP=$(curl -s4 https://api.ipify.org || curl -s4 https://icanhazip.com || echo "YOUR_VPS_IP")
 
 echo ""
-echo "[1/5] Updating packages and installing Tinyproxy..."
+echo "[1/5] Stopping old services and installing dependencies..."
+systemctl stop tinyproxy 2>/dev/null || true
+systemctl disable tinyproxy 2>/dev/null || true
+
 apt-get update -y
-apt-get install -y tinyproxy curl ufw
+apt-get install -y curl openssl gzip ufw
 
-echo "[2/5] Configuring proxy rules..."
-CONF_FILE="/etc/tinyproxy/tinyproxy.conf"
+echo "[2/5] Installing Gost binary..."
+GOST_VERSION="2.11.5"
+GOST_URL="https://github.com/ginuerzh/gost/releases/download/v${GOST_VERSION}/gost-linux-amd64-${GOST_VERSION}.gz"
 
-# Backup default config if not already backed up
-if [ ! -f "${CONF_FILE}.bak" ]; then
-    cp "$CONF_FILE" "${CONF_FILE}.bak"
-fi
+curl -fsSL "$GOST_URL" -o /tmp/gost.gz
+gzip -d -f /tmp/gost.gz
+mv /tmp/gost /usr/local/bin/gost
+chmod +x /usr/local/bin/gost
 
-# Reset config from backup
-cp "${CONF_FILE}.bak" "$CONF_FILE"
+echo "[3/5] Generating TLS Certificate for IP: ${PUBLIC_IP}..."
+mkdir -p /etc/gost
 
-# Set Port
-sed -i "s/^Port .*/Port ${PROXY_PORT}/" "$CONF_FILE"
+cat <<EOF > /etc/gost/openssl.cnf
+[req]
+distinguished_name = req_distinguished_name
+x509_extensions = v3_req
+prompt = no
 
-# Allow connections from any IP (default is 127.0.0.1 only)
-sed -i 's/^Allow /#Allow /' "$CONF_FILE"
+[req_distinguished_name]
+CN = ${PUBLIC_IP}
 
-# Allow CONNECT method to any destination port (critical for arbitrary API & dev ports)
-sed -i 's/^ConnectPort /#ConnectPort /' "$CONF_FILE"
+[v3_req]
+keyUsage = keyEncipherment, dataEncipherment
+extendedKeyUsage = serverAuth
+subjectAltName = @alt_names
 
-# Clean any existing BasicAuth lines and add credentials
-sed -i '/^BasicAuth /d' "$CONF_FILE"
-echo "BasicAuth ${PROXY_USER} ${PROXY_PASS}" >> "$CONF_FILE"
-
-# Save port for uninstaller
-echo "${PROXY_PORT}" > /etc/tinyproxy/.proxy_port
-
-echo "[3/5] Configuring firewall rules for port ${PROXY_PORT}..."
-if command -v ufw &> /dev/null && ufw status | grep -q "Status: active"; then
-    ufw allow ${PROXY_PORT}/tcp
-    echo "UFW rule added for port ${PROXY_PORT}."
-fi
-
-echo "[4/5] Starting Tinyproxy service..."
-systemctl restart tinyproxy
-systemctl enable tinyproxy
-
-echo "[5/5] Performing self-test verification..."
-sleep 2
-TEST_HTTP_CODE=$(curl -s -o /dev/null -w "%{http_code}" -x "http://${PROXY_USER}:${PROXY_PASS}@127.0.0.1:${PROXY_PORT}" --connect-timeout 5 https://www.google.com || echo "000")
-
-if [ "$TEST_HTTP_CODE" = "200" ]; then
-    echo " Self-test passed: Tinyproxy is accepting and routing connections."
-else
-    echo " Warning: Local self-test returned HTTP status code ${TEST_HTTP_CODE}. Service may still be initializing."
-fi
-
-# Fetch IP and Location Info
-IP_INFO=$(curl -s --connect-timeout 5 https://ipinfo.io/json || true)
-PUBLIC_IP=$(echo "$IP_INFO" | grep -oP '"ip":\s*"\K[^"]+' || curl -s4 https://api.ipify.org || echo "YOUR_VPS_IP")
-COUNTRY=$(echo "$IP_INFO" | grep -oP '"country":\s*"\K[^"]+' || echo "Unknown")
-CITY=$(echo "$IP_INFO" | grep -oP '"city":\s*"\K[^"]+' || echo "Unknown")
-
-PROXY_URL="http://${PROXY_USER}:${PROXY_PASS}@${PUBLIC_IP}:${PROXY_PORT}"
-
-echo ""
-echo "=========================================================="
-echo "              Proxy Setup Complete!                       "
-echo "=========================================================="
-echo "  Egress Location : ${CITY}, ${COUNTRY} (Detected)"
-echo "  Proxy URL       : ${PROXY_URL}"
-echo ""
-echo "Add this to your Antigravity / VS Code 'settings.json':"
-echo "----------------------------------------------------------"
-cat <<EOF
-"http.proxy": "${PROXY_URL}",
-"http.proxySupport": "on",
-"http.proxyStrictSSL": false
+[alt_names]
+IP.1 = ${PUBLIC_IP}
 EOF
-echo "----------------------------------------------------------"
+
+openssl req -x509 -nodes -days 3650 -newkey rsa:2048 \
+  -keyout /etc/gost/proxy.key \
+  -out /etc/gost/proxy.crt \
+  -config /etc/gost/openssl.cnf
+
+chmod 644 /etc/gost/proxy.crt
+chmod 600 /etc/gost/proxy.key
+
+echo "[4/5] Creating Systemd Service..."
+cat <<EOF > /etc/systemd/system/gost.service
+[Unit]
+Description=Gost Dual HTTP/HTTPS Proxy
+After=network.target
+
+[Service]
+Type=simple
+User=root
+ExecStart=/usr/local/bin/gost -L http://${PROXY_USER}:${PROXY_PASS}@:${HTTP_PORT} -L https://${PROXY_USER}:${PROXY_PASS}@:${HTTPS_PORT}?cert=/etc/gost/proxy.crt&key=/etc/gost/proxy.key
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target
+EOF
+
+systemctl daemon-reload
+systemctl enable gost
+systemctl restart gost
+
+echo "[5/5] Configuring firewall..."
+if command -v ufw &> /dev/null && ufw status | grep -q "Status: active"; then
+    ufw allow ${HTTP_PORT}/tcp
+    ufw allow ${HTTPS_PORT}/tcp
+fi
+
+sleep 2
+systemctl is-active --quiet gost && echo " Service is running smoothly!" || echo " Service starting..."
+
 echo ""
-echo "To test from your PC (PowerShell):"
-echo "  curl.exe -x \"${PROXY_URL}\" https://ipinfo.io/json"
+echo "=========================================================="
+echo "                   Setup Completed!                       "
+echo "=========================================================="
+echo ""
+echo " 1. FOR ANTIGRAVITY & VS CODE (Port ${HTTP_PORT}):"
+echo "----------------------------------------------------------"
+echo "\"http.proxy\": \"http://${PROXY_USER}:${PROXY_PASS}@${PUBLIC_IP}:${HTTP_PORT}\","
+echo "\"http.proxySupport\": \"on\","
+echo "\"http.proxyStrictSSL\": false"
+echo ""
+echo " 2. FOR BROWSER & YOUTUBE (Port ${HTTPS_PORT} - TLS Encrypted):"
+echo "----------------------------------------------------------"
+echo "  Protocol : HTTPS"
+echo "  Server   : ${PUBLIC_IP}"
+echo "  Port     : ${HTTPS_PORT}"
+echo "  Username : ${PROXY_USER}"
+echo "  Password : ${PROXY_PASS}"
+echo ""
+echo " 3. TO TRUST THE TLS CERTIFICATE IN WINDOWS (Run in PC PowerShell):"
+echo "----------------------------------------------------------"
+echo "scp root@${PUBLIC_IP}:/etc/gost/proxy.crt . ; Import-Certificate -FilePath .\\proxy.crt -CertStoreLocation Cert:\\CurrentUser\\Root"
 echo "=========================================================="

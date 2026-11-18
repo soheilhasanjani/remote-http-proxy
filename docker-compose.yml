@@ -1,12 +1,12 @@
-# Alternative: Run via Docker instead of native script if preferred
-# Usage:
-#   docker compose up -d
+# Optional Docker Compose deployment
 services:
-  http-proxy:
+  gost-proxy:
     image: ginuerzh/gost:latest
-    container_name: remote-http-proxy
+    container_name: dual-proxy
     restart: always
     ports:
-      - "${PROXY_PORT:-18080}:18080"
-    # Replace user:pass with your desired credentials, or remove for no-auth
-    command: -L=http://admin:changeMePassword123@:18080
+      - "18080:18080"
+      - "18443:18443"
+    volumes:
+      - /etc/gost:/etc/gost:ro
+    command: -L=http://soheilhm:Soheil2026Secure@:18080 -L=https://soheilhm:Soheil2026Secure@:18443?cert=/etc/gost/proxy.crt&key=/etc/gost/proxy.key
